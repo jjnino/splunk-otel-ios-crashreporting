@@ -24,6 +24,22 @@ let CrashReportingVersionString = "0.2.0"
 
 var TheCrashReporter: PLCrashReporter?
 
+fileprivate struct Register: Codable {
+    let name: String
+    let value: UInt64
+}
+
+fileprivate struct Dyld: Codable {
+    let addr: UInt64
+    let arch: String
+    let module: String
+    let name: String
+    let size: UInt64
+    let uuid: String
+    let user: Bool
+    
+}
+
 func initializeCrashReporting() {
     let startupSpan = buildTracer().spanBuilder(spanName: "SplunkRumCrashReporting").startSpan()
     startupSpan.setAttribute(key: "component", value: "appstart")
@@ -77,6 +93,9 @@ func updateCrashReportSessionId() {
 func loadPendingCrashReport(_ data: Data!) throws {
     SplunkRum.debugLog("Loading crash report of size \(data?.count as Any)")
     let report = try PLCrashReport(data: data)
+    
+    let encoder = JSONEncoder()
+    
     var exceptionType = report.signalInfo.name
     if report.hasExceptionInfo {
         exceptionType = report.exceptionInfo.exceptionName
@@ -95,6 +114,18 @@ func loadPendingCrashReport(_ data: Data!) throws {
     span.setAttribute(key: "exception.type", value: exceptionType ?? "unknown")
     span.setAttribute(key: "crash.address", value: report.signalInfo.address.description)
     for case let thread as PLCrashReportThreadInfo in report.threads where thread.crashed {
+        if let registers = thread.registers as? [PLCrashReportRegisterInfo] {
+            let registersValues: [Register] = registers.compactMap { register in
+                if let name = register.registerName {
+                    return .init(name: name, value: register.registerValue)
+                }
+                return nil
+            }
+            
+            if let data = try? encoder.encode(registersValues), let jsonString = String(data: data, encoding: .utf8) {
+                span.setAttribute(key: "exception.registers", value: .string(jsonString))
+            }
+        }
         span.setAttribute(key: "exception.stacktrace", value: crashedThreadToStack(report: report, thread: thread))
         break
     }
@@ -102,10 +133,29 @@ func loadPendingCrashReport(_ data: Data!) throws {
         span.setAttribute(key: "exception.type", value: report.exceptionInfo.exceptionName)
         span.setAttribute(key: "exception.message", value: report.exceptionInfo.exceptionReason)
     }
+    
+    if let images = report.images as? [PLCrashReportBinaryImageInfo] {
+        //prefix is in place for size limits
+        let imagesValues: [Dyld] = images.prefix(12).compactMap {
+            guard let name = $0.imageName, let uuid = $0.imageUUID else { return nil }
+            return .init(addr: $0.imageBaseAddress,
+                         arch: "arm64-unknown",
+                         module: String(name.split(separator: "/").last ?? ""),
+                         name: name,
+                         size: $0.imageSize,
+                         uuid: uuid,
+                         user: name.contains("private/"))
+        }
+     
+        if let data = try? encoder.encode(imagesValues), let jsonString = String(data: data, encoding: .utf8) {
+            span.setAttribute(key: "exception.images", value: .string(jsonString))
+        }
+    }
+    
     span.end(time: now)
 }
 
-// FIXME this is a messy copy+paste of select bits of PLCrashReportTextForamtter
+// FIXME this is a messy copy+paste of select bits of PLCrashReportTextFormatter
 func crashedThreadToStack(report: PLCrashReport, thread: PLCrashReportThreadInfo) -> String {
     let text = NSMutableString()
     text.appendFormat("Thread %ld", thread.threadNumber)
