@@ -29,15 +29,21 @@ fileprivate struct Register: Codable {
     let value: UInt64
 }
 
-fileprivate struct Dyld: Codable {
+fileprivate struct Thread: Codable {
+    let crashed: Bool
+    let number: Int
+    let frames: [Frame]
+    let recursions: [String]
+    let registers: [Register]
+}
+
+fileprivate struct Frame: Codable {
     let addr: UInt64
     let arch: String
     let module: String
     let name: String
     let size: UInt64
     let uuid: String
-    let user: Bool
-    
 }
 
 func initializeCrashReporting() {
@@ -79,11 +85,9 @@ func initializeCrashReporting() {
         // yes, fall through to purge
     }
     crashReporter.purgePendingCrashReport()
-
 }
 private func buildTracer() -> Tracer {
     return OpenTelemetry.instance.tracerProvider.get(instrumentationName: "splunk-ios-crashreporting", instrumentationVersion: CrashReportingVersionString)
-
 }
 
 func updateCrashReportSessionId() {
@@ -95,6 +99,7 @@ func loadPendingCrashReport(_ data: Data!) throws {
     let report = try PLCrashReport(data: data)
     
     let encoder = JSONEncoder()
+    encoder.outputFormatting = .prettyPrinted
     
     var exceptionType = report.signalInfo.name
     if report.hasExceptionInfo {
@@ -113,43 +118,55 @@ func loadPendingCrashReport(_ data: Data!) throws {
     span.addEvent(name: "crash.timestamp", timestamp: report.systemInfo.timestamp)
     span.setAttribute(key: "exception.type", value: exceptionType ?? "unknown")
     span.setAttribute(key: "crash.address", value: report.signalInfo.address.description)
-    for case let thread as PLCrashReportThreadInfo in report.threads where thread.crashed {
-        if let registers = thread.registers as? [PLCrashReportRegisterInfo] {
-            let registersValues: [Register] = registers.compactMap { register in
-                if let name = register.registerName {
-                    return .init(name: name, value: register.registerValue)
-                }
-                return nil
-            }
+    
+    var mythreads: [Thread] = []
+    for case let thread as PLCrashReportThreadInfo in report.threads {
+        
+        //MARK: REGISTERS
+        let registers: [Register] = thread.registers?.compactMap {
+            guard let register = $0 as? PLCrashReportRegisterInfo else { return nil }
             
-            if let data = try? encoder.encode(registersValues), let jsonString = String(data: data, encoding: .utf8) {
-                span.setAttribute(key: "exception.registers", value: .string(jsonString))
+            if let name = register.registerName {
+                return .init(name: name, value: register.registerValue)
             }
+            return nil
+            
+        } ?? []
+        
+        //MARK: FRAMES
+        let frames: [Frame] = thread.stackFrames?.compactMap { frame in
+            guard let f = frame as? PLCrashReportStackFrameInfo,
+                  let image = report.image(forAddress: f.instructionPointer) else { return nil }
+            
+            return Frame(addr: image.imageBaseAddress,
+                         arch: "codeType: \(image.codeType.type), subType: \(image.codeType.subtype)",
+                         module: URL(fileURLWithPath: image.imageName).lastPathComponent,
+                         name: image.imageName,
+                         size: image.imageSize,
+                         uuid: image.imageUUID)
+        } ?? []
+        
+        //MARK: THREAD
+        mythreads.append(
+            Thread(crashed: thread.crashed,
+                   number: thread.threadNumber,
+                   frames: frames,
+                   recursions: [],
+                   registers: registers)
+        )
+        
+        if thread.crashed {
+            span.setAttribute(key: "exception.stacktrace", value: crashedThreadToStack(report: report, thread: thread))
         }
-        span.setAttribute(key: "exception.stacktrace", value: crashedThreadToStack(report: report, thread: thread))
-        break
     }
+    
+    if let data = try? encoder.encode(mythreads), let jsonString = String(data: data, encoding: .utf8) {
+        print(jsonString)
+    }
+        
     if report.hasExceptionInfo {
         span.setAttribute(key: "exception.type", value: report.exceptionInfo.exceptionName)
         span.setAttribute(key: "exception.message", value: report.exceptionInfo.exceptionReason)
-    }
-    
-    if let images = report.images as? [PLCrashReportBinaryImageInfo] {
-        //prefix is in place for size limits
-        let imagesValues: [Dyld] = images.prefix(12).compactMap {
-            guard let name = $0.imageName, let uuid = $0.imageUUID else { return nil }
-            return .init(addr: $0.imageBaseAddress,
-                         arch: "arm64-unknown",
-                         module: String(name.split(separator: "/").last ?? ""),
-                         name: name,
-                         size: $0.imageSize,
-                         uuid: uuid,
-                         user: name.contains("private/"))
-        }
-     
-        if let data = try? encoder.encode(imagesValues), let jsonString = String(data: data, encoding: .utf8) {
-            span.setAttribute(key: "exception.images", value: .string(jsonString))
-        }
     }
     
     span.end(time: now)
