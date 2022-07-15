@@ -161,7 +161,7 @@ func loadPendingCrashReport(_ data: Data!) throws {
     }
     
     if let data = try? encoder.encode(mythreads), let jsonString = String(data: data, encoding: .utf8) {
-        print(jsonString)
+        span.setAttribute(key: "exception.crashreport", value: .string(jsonString))
     }
         
     if report.hasExceptionInfo {
