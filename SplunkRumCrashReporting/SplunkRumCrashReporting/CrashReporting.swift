@@ -24,6 +24,46 @@ let CrashReportingVersionString = "0.2.0"
 
 var TheCrashReporter: PLCrashReporter?
 
+fileprivate struct Crash: Codable {
+    let code_type: String
+    let dyld: [Dyld]
+    let identifier: String
+    let incident_id: String
+    let is64: Bool
+    let launch_time: Double
+    let parent_id: UInt
+    let parent_name: String
+    let path: String
+    let process_id: UInt
+    let process_name: String
+    let signal: Signal
+    let signatures: [String]
+    let threads: [Thread]
+    let exception: Exception
+}
+
+fileprivate struct Exception: Codable {
+    let frames: [Frame]
+    let name: String
+    let reason: String
+}
+
+fileprivate struct Dyld: Codable {
+    let addr: UInt64
+    let arch: String
+    let module: String
+    let name: String
+    let size: UInt64
+    let user: Bool
+    let uuid: String
+}
+
+fileprivate struct Signal: Codable {
+    let addr: UInt64
+    let code: String
+    let name: String
+}
+
 fileprivate struct Register: Codable {
     let name: String
     let value: UInt64
@@ -33,17 +73,11 @@ fileprivate struct Thread: Codable {
     let crashed: Bool
     let number: Int
     let frames: [Frame]
-    let recursions: [String]
     let registers: [Register]
 }
 
 fileprivate struct Frame: Codable {
     let addr: UInt64
-    let arch: String
-    let module: String
-    let name: String
-    let size: UInt64
-    let uuid: String
 }
 
 func initializeCrashReporting() {
@@ -91,7 +125,7 @@ private func buildTracer() -> Tracer {
 }
 
 func updateCrashReportSessionId() {
-   TheCrashReporter?.customData = SplunkRum.getSessionId().data(using: .utf8)
+    TheCrashReporter?.customData = SplunkRum.getSessionId().data(using: .utf8)
 }
 
 func loadPendingCrashReport(_ data: Data!) throws {
@@ -120,6 +154,7 @@ func loadPendingCrashReport(_ data: Data!) throws {
     span.setAttribute(key: "crash.address", value: report.signalInfo.address.description)
     
     var mythreads: [Thread] = []
+    var myDylds: [Dyld] = []
     for case let thread as PLCrashReportThreadInfo in report.threads {
         
         //MARK: REGISTERS
@@ -133,17 +168,54 @@ func loadPendingCrashReport(_ data: Data!) throws {
             
         } ?? []
         
+        //MARK: DYLDs
+        func getArchName(using cpuType: UInt64, and subType: UInt64) -> String {
+            switch cpuType {
+                case UInt64(CPU_TYPE_ARM):
+                    switch Int32(subType) {
+                        case CPU_SUBTYPE_ARM_V6:
+                            return "armv6"
+                        case CPU_SUBTYPE_ARM_V7:
+                            return "armv7"
+                        case CPU_SUBTYPE_ARM_V7S:
+                            return "armv7s"
+                        default:
+                            return "arm-unknown"
+                    }
+                case UInt64(CPU_TYPE_ARM64):
+                    switch UInt64(subType) {
+                        case UInt64(CPU_SUBTYPE_ARM_ALL):
+                            return "arm64"
+                        case UInt64(CPU_SUBTYPE_ARM_V8):
+                            return "arm64"
+                        case UInt64(CPU_SUBTYPE_ARM64E):
+                            return "arm64e"
+                        default:
+                            return "arm64-unknown"
+                    }
+                    
+                default: return "???"
+            }
+        }
         //MARK: FRAMES
         let frames: [Frame] = thread.stackFrames?.compactMap { frame in
             guard let f = frame as? PLCrashReportStackFrameInfo,
                   let image = report.image(forAddress: f.instructionPointer) else { return nil }
+            var uuid = image.imageUUID ?? ""
+            uuid.insert("-", at: uuid.index(uuid.startIndex, offsetBy: 8))
+            uuid.insert("-", at: uuid.index(uuid.startIndex, offsetBy: 13))
+            uuid.insert("-", at: uuid.index(uuid.startIndex, offsetBy: 18))
+            uuid.insert("-", at: uuid.index(uuid.startIndex, offsetBy: 23))
             
-            return Frame(addr: image.imageBaseAddress,
-                         arch: "codeType: \(image.codeType.type), subType: \(image.codeType.subtype)",
-                         module: URL(fileURLWithPath: image.imageName).lastPathComponent,
-                         name: image.imageName,
-                         size: image.imageSize,
-                         uuid: image.imageUUID)
+            myDylds.append(.init(addr: image.imageBaseAddress,
+                                 arch: getArchName(using: image.codeType.type, and: image.codeType.subtype),
+                                 module: URL(fileURLWithPath: image.imageName).lastPathComponent,
+                                 name: image.imageName,
+                                 size: image.imageSize,
+                                 user: image.imageName.contains("private"),
+                                 uuid: uuid.uppercased()))
+            
+            return Frame(addr: f.instructionPointer)
         } ?? []
         
         //MARK: THREAD
@@ -151,7 +223,6 @@ func loadPendingCrashReport(_ data: Data!) throws {
             Thread(crashed: thread.crashed,
                    number: thread.threadNumber,
                    frames: frames,
-                   recursions: [],
                    registers: registers)
         )
         
@@ -160,10 +231,32 @@ func loadPendingCrashReport(_ data: Data!) throws {
         }
     }
     
-    if let data = try? encoder.encode(mythreads), let jsonString = String(data: data, encoding: .utf8) {
+    //MARK: CRASH
+    let exceptionFrames: [Frame] = report.exceptionInfo?.stackFrames?.compactMap { frame in
+        guard let f = frame as? PLCrashReportStackFrameInfo else { return nil }
+        return Frame(addr: f.instructionPointer)
+    } ?? []
+    let crash = Crash(code_type: "ARM-64",
+                      dyld: myDylds,
+                      identifier: report.applicationInfo.applicationIdentifier,
+                      incident_id: UUID().uuidString,
+                      is64: true,
+                      launch_time: report.processInfo.processStartTime.timeIntervalSince1970,
+                      parent_id: report.processInfo.parentProcessID,
+                      parent_name: report.processInfo.parentProcessName ?? "???",
+                      path: report.processInfo.processPath ?? "",
+                      process_id: report.processInfo.processID,
+                      process_name: report.processInfo.processName ?? "",
+                      signal: .init(addr: report.signalInfo?.address ?? 0, code: report.signalInfo?.code ?? "", name: report.signalInfo?.name ?? ""),
+                      signatures: [],
+                      threads: mythreads,
+                      exception: .init(frames: exceptionFrames, name: report.exceptionInfo?.exceptionName ?? "", reason: report.exceptionInfo?.exceptionReason ?? ""))
+    
+    if let data = try? encoder.encode(crash), let jsonString = String(data: data, encoding: .utf8) {
         span.setAttribute(key: "exception.crashreport", value: .string(jsonString))
+        print(jsonString)
     }
-        
+    
     if report.hasExceptionInfo {
         span.setAttribute(key: "exception.type", value: report.exceptionInfo.exceptionName)
         span.setAttribute(key: "exception.message", value: report.exceptionInfo.exceptionReason)
