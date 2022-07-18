@@ -207,13 +207,15 @@ func loadPendingCrashReport(_ data: Data!) throws {
             uuid.insert("-", at: uuid.index(uuid.startIndex, offsetBy: 18))
             uuid.insert("-", at: uuid.index(uuid.startIndex, offsetBy: 23))
             
-            myDylds.append(.init(addr: image.imageBaseAddress,
-                                 arch: getArchName(using: image.codeType.type, and: image.codeType.subtype),
-                                 module: URL(fileURLWithPath: image.imageName).lastPathComponent,
-                                 name: image.imageName,
-                                 size: image.imageSize,
-                                 user: image.imageName.contains("private"),
-                                 uuid: uuid.uppercased()))
+            if !myDylds.contains(where: { $0.name == image.imageName }) {
+                myDylds.append(.init(addr: image.imageBaseAddress,
+                                     arch: getArchName(using: image.codeType.type, and: image.codeType.subtype),
+                                     module: URL(fileURLWithPath: image.imageName).lastPathComponent,
+                                     name: image.imageName,
+                                     size: image.imageSize,
+                                     user: image.imageName.contains("private"),
+                                     uuid: uuid.uppercased()))
+            }
             
             return Frame(addr: f.instructionPointer)
         } ?? []
