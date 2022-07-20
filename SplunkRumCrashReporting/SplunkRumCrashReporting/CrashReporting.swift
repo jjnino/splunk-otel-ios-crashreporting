@@ -153,6 +153,35 @@ func loadPendingCrashReport(_ data: Data!) throws {
     span.setAttribute(key: "exception.type", value: exceptionType ?? "unknown")
     span.setAttribute(key: "crash.address", value: report.signalInfo.address.description)
     
+    func getArchName(using cpuType: UInt64, and subType: UInt64) -> String {
+        switch cpuType {
+            case UInt64(CPU_TYPE_ARM):
+                switch Int32(subType) {
+                    case CPU_SUBTYPE_ARM_V6:
+                        return "armv6"
+                    case CPU_SUBTYPE_ARM_V7:
+                        return "armv7"
+                    case CPU_SUBTYPE_ARM_V7S:
+                        return "armv7s"
+                    default:
+                        return "arm-unknown"
+                }
+            case UInt64(CPU_TYPE_ARM64):
+                switch UInt64(subType) {
+                    case UInt64(CPU_SUBTYPE_ARM_ALL):
+                        return "arm64"
+                    case UInt64(CPU_SUBTYPE_ARM_V8):
+                        return "arm64"
+                    case UInt64(CPU_SUBTYPE_ARM64E):
+                        return "arm64e"
+                    default:
+                        return "arm64-unknown"
+                }
+                
+            default: return "???"
+        }
+    }
+    
     var mythreads: [Thread] = []
     var myDylds: [Dyld] = []
     for case let thread as PLCrashReportThreadInfo in report.threads {
@@ -168,39 +197,14 @@ func loadPendingCrashReport(_ data: Data!) throws {
             
         } ?? []
         
-        //MARK: DYLDs
-        func getArchName(using cpuType: UInt64, and subType: UInt64) -> String {
-            switch cpuType {
-                case UInt64(CPU_TYPE_ARM):
-                    switch Int32(subType) {
-                        case CPU_SUBTYPE_ARM_V6:
-                            return "armv6"
-                        case CPU_SUBTYPE_ARM_V7:
-                            return "armv7"
-                        case CPU_SUBTYPE_ARM_V7S:
-                            return "armv7s"
-                        default:
-                            return "arm-unknown"
-                    }
-                case UInt64(CPU_TYPE_ARM64):
-                    switch UInt64(subType) {
-                        case UInt64(CPU_SUBTYPE_ARM_ALL):
-                            return "arm64"
-                        case UInt64(CPU_SUBTYPE_ARM_V8):
-                            return "arm64"
-                        case UInt64(CPU_SUBTYPE_ARM64E):
-                            return "arm64e"
-                        default:
-                            return "arm64-unknown"
-                    }
-                    
-                default: return "???"
-            }
-        }
         //MARK: FRAMES
         let frames: [Frame] = thread.stackFrames?.compactMap { frame in
             guard let f = frame as? PLCrashReportStackFrameInfo,
-                  let image = report.image(forAddress: f.instructionPointer) else { return nil }
+                  let image = report.image(forAddress: f.instructionPointer) else {
+                return nil
+            }
+            
+            //MARK: DYLDs
             var uuid = image.imageUUID ?? ""
             uuid.insert("-", at: uuid.index(uuid.startIndex, offsetBy: 8))
             uuid.insert("-", at: uuid.index(uuid.startIndex, offsetBy: 13))
@@ -235,7 +239,29 @@ func loadPendingCrashReport(_ data: Data!) throws {
     
     //MARK: CRASH
     let exceptionFrames: [Frame] = report.exceptionInfo?.stackFrames?.compactMap { frame in
-        guard let f = frame as? PLCrashReportStackFrameInfo else { return nil }
+        guard let f = frame as? PLCrashReportStackFrameInfo,
+              let image = report.image(forAddress: f.instructionPointer) else {
+            return nil
+        }
+        
+        //MARK: DYLDs
+        
+        var uuid = image.imageUUID ?? ""
+        uuid.insert("-", at: uuid.index(uuid.startIndex, offsetBy: 8))
+        uuid.insert("-", at: uuid.index(uuid.startIndex, offsetBy: 13))
+        uuid.insert("-", at: uuid.index(uuid.startIndex, offsetBy: 18))
+        uuid.insert("-", at: uuid.index(uuid.startIndex, offsetBy: 23))
+        
+        if !myDylds.contains(where: { $0.name == image.imageName }) {
+            myDylds.append(.init(addr: image.imageBaseAddress,
+                                 arch: getArchName(using: image.codeType.type, and: image.codeType.subtype),
+                                 module: URL(fileURLWithPath: image.imageName).lastPathComponent,
+                                 name: image.imageName,
+                                 size: image.imageSize,
+                                 user: image.imageName.contains("private"),
+                                 uuid: uuid.uppercased()))
+        }
+        
         return Frame(addr: f.instructionPointer)
     } ?? []
     let crash = Crash(code_type: "ARM-64",
